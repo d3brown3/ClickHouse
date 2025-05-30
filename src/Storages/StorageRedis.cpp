@@ -11,6 +11,8 @@
 #include <Processors/ISource.h>
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/SourceStepWithFilter.h>
 
 #include <Storages/KVStorageUtils.h>
 #include <Storages/KeyDescription.h>
@@ -36,114 +38,177 @@ namespace ErrorCodes
     extern const int INTERNAL_REDIS_ERROR;
 }
 
-class RedisDataSource : public ISource
+class ReadFromRedis : public SourceStepWithFilter
 {
 public:
-    RedisDataSource(
-        StorageRedis & storage_,
-        const Block & header,
-        FieldVectorPtr keys_,
-        FieldVector::const_iterator begin_,
-        FieldVector::const_iterator end_,
-        const size_t max_block_size_)
-        : ISource(header)
+    ReadFromRedis(
+        const Names & column_names_,
+        const SelectQueryInfo & query_info_,
+        const StorageSnapshotPtr & storage_snapshot_,
+        const ContextPtr & context_,
+        Block sample_block_,
+        const StorageRedis & storage_,
+        size_t max_block_size_)
+        : SourceStepWithFilter(std::move(sample_block_), column_names_, query_info_, storage_snapshot_, context_)
         , storage(storage_)
-        , primary_key_pos(getPrimaryKeyPos(header, storage.getPrimaryKey()))
-        , keys(keys_)
-        , begin(begin_)
-        , end(end_)
-        , it(begin)
+        , primary_key_pos(getPrimaryKeyPos(getOutputHeader(), storage.getPrimaryKey()))
         , max_block_size(max_block_size_)
+        , log(getLogger("ReadFromRedis"))
     {
     }
 
-    RedisDataSource(StorageRedis & storage_, const Block & header, const size_t max_block_size_, const String & pattern_ = "*")
-        : ISource(header)
-        , storage(storage_)
-        , primary_key_pos(getPrimaryKeyPos(header, storage.getPrimaryKey()))
-        , iterator(-1)
-        , pattern(pattern_)
-        , max_block_size(max_block_size_)
-    {
-    }
+    String getName() const override { return "ReadFromRedis"; }
 
-    String getName() const override { return storage.getName(); }
-
-    Chunk generate() override
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override
     {
-        if (keys)
-            return generateWithKeys();
-        return generateFullScan();
-    }
+        const auto & primary_key = storage.getPrimaryKey().at(0);
+        const auto & primary_key_data_type = getOutputHeader().getByName(primary_key).type;
+        
+        FieldVectorPtr keys;
+        bool all_scan = false;
 
-    Chunk generateWithKeys()
-    {
-        const auto & sample_block = getPort().getHeader();
-        if (it >= end)
+        std::tie(keys, all_scan) = getFilterKeys(primary_key, primary_key_data_type, query_info, context);
+
+        if (all_scan)
         {
-            it = {};
-            return {};
+            LOG_DEBUG(log, "Using full scan mode");
+            pipeline.init(createFullScanPipe());
         }
-
-        const auto & key_column_type = sample_block.getByName(storage.getPrimaryKey().at(0)).type;
-        auto raw_keys = serializeKeysToRawString(it, end, key_column_type, max_block_size);
-
-        return storage.getBySerializedKeys(raw_keys, nullptr);
-    }
-
-    /// TODO scan may get duplicated keys when Redis is rehashing, it is a very rare case.
-    Chunk generateFullScan()
-    {
-        checkStackSize();
-
-        /// redis scan ending
-        if (iterator == 0)
-            return {};
-
-        RedisArray scan_keys;
-        RedisIterator next_iterator;
-
-        std::tie(next_iterator, scan_keys) = storage.scan(iterator == -1 ? 0 : iterator, pattern, max_block_size);
-        iterator = next_iterator;
-
-        /// redis scan can return nothing
-        if (scan_keys.isNull() || scan_keys.size() == 0)
-            return generateFullScan();
-
-        const auto & sample_block = getPort().getHeader();
-        MutableColumns columns = sample_block.cloneEmptyColumns();
-
-        RedisArray values = storage.multiGet(scan_keys);
-        for (size_t i = 0; i < scan_keys.size() && !values.get<RedisBulkString>(i).isNull(); i++)
+        else if (keys && !keys->empty())
         {
-            fillColumns(scan_keys.get<RedisBulkString>(i).value(),
-                        values.get<RedisBulkString>(i).value(),
-                        primary_key_pos, sample_block, columns
-            );
+            LOG_DEBUG(log, "Using direct key lookup for {} keys", keys->size());
+            pipeline.init(createPointQueryPipe(std::move(keys)));
         }
-
-        Block block = sample_block.cloneWithColumns(std::move(columns));
-        return Chunk(block.getColumns(), block.rows());
     }
 
 private:
-    StorageRedis & storage;
+    Pipe createFullScanPipe()
+    {
+        return createRedisDataSourcePipe();
+    }
+    
+    Pipe createPointQueryPipe(FieldVectorPtr keys)
+    {
+        ::sort(keys->begin(), keys->end());
+        keys->erase(std::unique(keys->begin(), keys->end()), keys->end());
 
+        size_t num_streams = std::min<size_t>(1, keys->size());
+        num_streams = std::min<size_t>(num_streams, max_block_size);
+        
+        const auto & key_column_type = getOutputHeader().getByName(storage.getPrimaryKey().at(0)).type;
+        auto raw_keys = serializeKeysToRawString(keys->begin(), keys->end(), key_column_type, max_block_size);
+        
+        RedisArray redis_keys;
+        for (const auto & key : raw_keys)
+            redis_keys.add(key);
+        
+        // Direct key lookup using MGET
+        auto chunk = storage.getBySerializedKeys(redis_keys, nullptr);
+        
+        return createSourceFromSingleChunk(std::move(chunk));
+    }
+
+    Pipe createRedisDataSourcePipe()
+    {
+        // Full scan mode - fallback
+        auto source = std::make_shared<RedisDataSource>(storage, getOutputHeader(), max_block_size);
+        return Pipe(std::move(source));
+    }
+    
+    Pipe createSourceFromSingleChunk(Chunk && chunk)
+    {
+        auto source = std::make_shared<SourceFromSingleChunk>(getOutputHeader(), std::move(chunk));
+        return Pipe(std::move(source));
+    }
+
+    class RedisDataSource : public ISource
+    {
+    public:
+        RedisDataSource(
+            const StorageRedis & storage_,
+            const Block & header,
+            const size_t max_block_size_,
+            const String & pattern_ = "*")
+            : ISource(header)
+            , storage(storage_)
+            , primary_key_pos(getPrimaryKeyPos(header, storage.getPrimaryKey()))
+            , iterator(-1)
+            , pattern(pattern_)
+            , max_block_size(max_block_size_)
+        {
+        }
+
+        String getName() const override { return "RedisDataSource"; }
+
+        Chunk generate() override
+        {
+            checkStackSize();
+
+            /// redis scan ending
+            if (iterator == 0)
+                return {};
+
+            RedisArray scan_keys;
+            RedisIterator next_iterator;
+
+            std::tie(next_iterator, scan_keys) = storage.scan(iterator == -1 ? 0 : iterator, pattern, max_block_size);
+            iterator = next_iterator;
+
+            /// redis scan can return nothing
+            if (scan_keys.isNull() || scan_keys.size() == 0)
+                return generate();
+
+            const auto & sample_block = getPort().getHeader();
+            MutableColumns columns = sample_block.cloneEmptyColumns();
+
+            RedisArray values = storage.multiGet(scan_keys);
+            for (size_t i = 0; i < scan_keys.size() && !values.get<RedisBulkString>(i).isNull(); i++)
+            {
+                fillColumns(scan_keys.get<RedisBulkString>(i).value(),
+                            values.get<RedisBulkString>(i).value(),
+                            primary_key_pos, sample_block, columns
+                );
+            }
+
+            Block block = sample_block.cloneWithColumns(std::move(columns));
+            return Chunk(block.getColumns(), block.rows());
+        }
+
+    private:
+        const StorageRedis & storage;
+        size_t primary_key_pos;
+        RedisIterator iterator;
+        String pattern;
+        const size_t max_block_size;
+    };
+    
+    class SourceFromSingleChunk : public ISource
+    {
+    public:
+        SourceFromSingleChunk(const Block & header_, Chunk && chunk_)
+            : ISource(header_), chunk(std::move(chunk_)), generated(false) {}
+
+        String getName() const override { return "SourceFromSingleChunk"; }
+
+        Chunk generate() override
+        {
+            if (generated)
+                return {};
+                
+            generated = true;
+            return std::move(chunk);
+        }
+
+    private:
+        Chunk chunk;
+        bool generated;
+    };
+
+    const StorageRedis & storage;
     size_t primary_key_pos;
-
-    /// For key scan
-    FieldVectorPtr keys = nullptr;
-    FieldVector::const_iterator begin;
-    FieldVector::const_iterator end;
-    FieldVector::const_iterator it;
-
-    /// For full scan
-    RedisIterator iterator;
-    String pattern;
-
-    const size_t max_block_size;
+    size_t max_block_size;
+    LoggerPtr log;
 };
-
 
 class RedisSink : public SinkToStorage
 {
@@ -216,53 +281,30 @@ StorageRedis::StorageRedis(
     setInMemoryMetadata(storage_metadata);
 }
 
-Pipe StorageRedis::read(
+void StorageRedis::read(
+    QueryPlan & query_plan,
     const Names & column_names,
     const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr context_,
     QueryProcessingStage::Enum /*processed_stage*/,
     size_t max_block_size,
-    size_t num_streams)
+    size_t /*num_streams*/)
 {
     storage_snapshot->check(column_names);
 
-    FieldVectorPtr keys;
-    bool all_scan = false;
-
     Block header = storage_snapshot->metadata->getSampleBlock();
-    auto primary_key_data_type = header.getByName(primary_key).type;
 
-    std::tie(keys, all_scan) = getFilterKeys(primary_key, primary_key_data_type, query_info, context_);
+    auto reading = std::make_unique<ReadFromRedis>(
+        column_names,
+        query_info,
+        storage_snapshot,
+        context_,
+        header,
+        *this,
+        max_block_size);
 
-    if (all_scan)
-    {
-        return Pipe(std::make_shared<RedisDataSource>(*this, header, max_block_size));
-    }
-
-    if (keys->empty())
-        return {};
-
-    Pipes pipes;
-
-    ::sort(keys->begin(), keys->end());
-    keys->erase(std::unique(keys->begin(), keys->end()), keys->end());
-
-    size_t num_keys = keys->size();
-    size_t num_threads = std::min<size_t>(num_streams, keys->size());
-
-    num_threads = std::min<size_t>(num_threads, configuration.pool_size);
-    assert(num_keys <= std::numeric_limits<uint32_t>::max());
-
-    for (size_t thread_idx = 0; thread_idx < num_threads; ++thread_idx)
-    {
-        size_t begin = num_keys * thread_idx / num_threads;
-        size_t end = num_keys * (thread_idx + 1) / num_threads;
-
-        pipes.emplace_back(
-            std::make_shared<RedisDataSource>(*this, header, keys, keys->begin() + begin, keys->begin() + end, max_block_size));
-    }
-    return Pipe::unitePipes(std::move(pipes));
+    query_plan.addStep(std::move(reading));
 }
 
 namespace

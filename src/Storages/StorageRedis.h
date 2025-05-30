@@ -6,6 +6,7 @@
 #include <Interpreters/IKeyValueEntity.h>
 #include <Interpreters/Context_fwd.h>
 #include <Storages/MutationCommands.h>
+#include <Interpreters/SelectQueryInfo.h>
 
 namespace DB
 {
@@ -24,7 +25,8 @@ public:
 
     std::string getName() const override { return "Redis"; }
 
-    Pipe read(
+    void read(
+        QueryPlan & query_plan,
         const Names & column_names,
         const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
